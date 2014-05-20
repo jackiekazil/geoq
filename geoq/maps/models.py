@@ -10,6 +10,7 @@ from django.core.exceptions import ValidationError
 from django.utils.datastructures import SortedDict
 from django.core.urlresolvers import reverse
 from jsonfield import JSONField
+from datetime import datetime
 
 IMAGE_FORMATS = (
                 ('image/png', 'image/png'),
@@ -40,18 +41,18 @@ IMAGE_FORMATS = (
 )
 
 SERVICE_TYPES = (
+                ('WMS', 'WMS'),
+                ('KML', 'KML'),
+                ('GeoRSS', 'GeoRSS'),
                 ('ESRI Tiled Map Service', 'ESRI Tiled Map Service'),
                 ('ESRI Dynamic Map Layer', 'ESRI Dynamic Map Layer'),
                 ('ESRI Feature Layer', 'ESRI Feature Layer'),
                 ('GeoJSON', 'GeoJSON'),
-                ('WMS', 'WMS'),
-                ('ESRI Clustered Feature Layer', 'ESRI Clustered Feature Layer')
+                ('ESRI Clustered Feature Layer', 'ESRI Clustered Feature Layer'),
                 #('ArcGIS93Rest', 'ArcGIS93Rest'),
-                #('KML', 'KML'),
-                #('GeoRSS', 'GeoRSS'),
-                #('GPX','GPX'),
+                ('GPX', 'GPX'),
                 #('GML','GML'),
-                #('WMTS', 'WMTS'),
+                ('WMTS', 'WMTS'),
                 #('MapBox', 'MapBox'),
                 #('TileServer','TileServer'),
                 #('GetCapabilities', 'GetCapabilities'),
@@ -127,10 +128,35 @@ class Layer(models.Model):
 
     def get_layer_params(self):
         """
-        Converts a layer's parameters to json.
+        Returns the layer_params attribute, which should be json
         """
-
         return self.layer_params
+
+    def layer_json(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "format": self.image_format,
+            "type": self.type,
+            "url": self.url,
+            "subdomains": self.get_layer_urls(),
+            "layer": self.layer,
+            "transparent": self.transparent,
+            "layerParams": self.layer_params,
+            "refreshrate": self.refreshrate,
+            "token": self.token,
+            "attribution": self.attribution,
+            "spatialReference": self.spatial_reference,
+            "layerParsingFunction": self.layer_parsing_function,
+            "enableIdentify": self.enable_identify,
+            "rootField": self.root_field,
+            "infoFormat": self.info_format,
+            "fieldsToShow": self.fields_to_show,
+            "description": self.description,
+            "downloadableLink": self.downloadableLink,
+            "styles": self.styles,
+        }
+
 
     class Meta:
         ordering = ["name"]
@@ -207,13 +233,20 @@ class Map(models.Model):
 
         return map_services
 
+    def all_map_layers_json(self):
+        map_services = list()
+        for layer in Layer.objects.all():
+            map_services.append(layer.layer_json())
+        return json.dumps(map_services)
+
     def to_json(self):
         return json.dumps({
             "center_x": self.center_x,
             "center_y": self.center_y,
             "zoom": self.zoom,
             "projection": self.projection or "EPSG:4326",
-            "layers": self.map_layers_json()
+            "layers": self.map_layers_json(),
+            "all_layers": self.all_map_layers_json()
         })
 
     def get_absolute_url(self):
@@ -266,11 +299,14 @@ class Feature(models.Model):
         Returns geoJSON of the feature.
         Try to conform to https://github.com/mapbox/simplestyle-spec/tree/master/1.0.0
         """
-
+        
         geojson = SortedDict()
         geojson["type"] = "Feature"
         geojson["properties"] = dict(id=self.id,
-                                     template=self.template.id if hasattr(self.template, "id") else None
+                                     template=self.template.id if hasattr(self.template, "id") else None,
+                                     analyst=self.analyst.username,
+                                     created_at=datetime.strftime(self.created_at, '%Y-%m-%dT%H:%M:%S%Z'),
+                                     updated_at=datetime.strftime(self.updated_at, '%Y-%m-%dT%H:%M:%S%Z')
                                      )
         geojson["geometry"] = json.loads(self.the_geom.json)
 

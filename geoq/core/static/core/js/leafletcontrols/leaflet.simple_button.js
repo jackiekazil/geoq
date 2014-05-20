@@ -1,4 +1,6 @@
 L.Control.Button = L.Control.extend({
+// Requires jQuery for some functions
+//
 //  USAGE:
 //    var myButtonOptions = {
 //      'text': 'MyButton',  // string
@@ -20,15 +22,24 @@ L.Control.Button = L.Control.extend({
   },
   initialize: function (options) {
     this._button = {};
+    if (options.position) {
+        this.options.position = options.position;
+    } else {
+        this.options.position = 'bottomleft'
+    }
     this.setButton(options);
   },
 
   onAdd: function (map) {
     this._map = map;
     var container = L.DomUtil.create('div', 'leaflet-control-button');
-	
+
+    L.DomEvent.on(container, 'mousedown', L.DomEvent.stopPropagation)
+        .on(container, 'doubleclick', L.DomEvent.stopPropagation)
+        .on(container, 'click', L.DomEvent.stopPropagation);
+
     this._container = container;
-    
+
     this._update();
     return this._container;
   },

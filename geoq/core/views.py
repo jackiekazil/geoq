@@ -5,24 +5,21 @@
 import json
 import requests
 
-from django.contrib.auth.models import User
 from django.contrib.auth.decorators import login_required
-from django.http import Http404, HttpResponse
-
 from django.contrib.gis.geos import GEOSGeometry
 from django.core.urlresolvers import reverse
 from django.core.exceptions import ObjectDoesNotExist
 from django.forms.util import ValidationError
-from django.http import HttpResponse, HttpResponseRedirect
-from django.shortcuts import get_object_or_404
-from django.utils.decorators import method_decorator
+from django.http import Http404, HttpResponse, HttpResponseRedirect
+from django.shortcuts import get_object_or_404, redirect
 from django.views.generic import DetailView, ListView, TemplateView, View, DeleteView, CreateView
 
 from models import Project, Job, AOI
 from geoq.maps.models import Layer, Map
 
 from geoq.mgrs.utils import Grid, GridException
-from geoq.mgrs import utils
+from geoq.core.utils import send_aoi_create_event
+from geoq.mgrs.exceptions import ProgramException
 
 
 class Dashboard(TemplateView):
@@ -63,7 +60,6 @@ class BatchCreateAOIS(TemplateView):
         return HttpResponse()
 
 
-
 #TODO: Abstract this
 class DetailedListView(ListView):
     """
@@ -88,6 +84,8 @@ class CreateFeaturesView(DetailView):
 
     def get_context_data(self, **kwargs):
         cv = super(CreateFeaturesView, self).get_context_data(**kwargs)
+        cv['reviewers'] = kwargs['object'].job.reviewers.all()
+
         cv['map'] = self.object.job.map
         cv['aoi'].analyst = self.request.user
         cv['aoi'].status = 'In work'
@@ -108,7 +106,6 @@ def redirect_to_unassigned_aoi(request, pk):
         return HttpResponseRedirect(job.get_absolute_url())
 
 
-
 class JobDetailedListView(ListView):
     """
     A mixture between a list view and detailed view.
@@ -116,11 +113,24 @@ class JobDetailedListView(ListView):
 
     paginate_by = 15
     model = Job
-    default_status = 'unassigned'
+    default_status = 'in work'
+    request = None
 
     def get_queryset(self):
         status = getattr(self, 'status', None)
-        self.queryset = AOI.objects.filter(job=self.kwargs.get('pk'))
+        q_set = AOI.objects.filter(job=self.kwargs.get('pk'))
+
+        # # If there is a user logged in, we want to show their stuff
+        # # at the top of the list
+        if self.request.user.id is not None and status == 'in work':
+            user = self.request.user
+            clauses = 'WHEN analyst_id=%s THEN %s ELSE 1' % (user.id, 0)
+            ordering = 'CASE %s END' % clauses
+            self.queryset = q_set.extra(
+               select={'ordering': ordering}, order_by=('ordering',))
+        else:
+            self.queryset = q_set
+
         if status and (status in [value.lower() for value in AOI.STATUS_VALUES]):
             return self.queryset.filter(status__iexact=status)
         else:
@@ -133,6 +143,8 @@ class JobDetailedListView(ListView):
             self.status = self.status.lower()
         else:
             self.status = self.default_status.lower()
+
+        self.request = request
 
         return super(JobDetailedListView, self).get(request, *args, **kwargs)
 
@@ -162,6 +174,7 @@ class AOIDelete(DeleteView):
 
     def get_success_url(self):
         return reverse('job-detail', args=[self.object.job.pk])
+
 
 class AOIDetailedListView(ListView):
     """
@@ -227,19 +240,42 @@ class CreateJobView(CreateView):
 
 
 class ChangeAOIStatus(View):
-    http_method_names = ['post']
+    http_method_names = ['post','get']
 
-    def post(self, request, **kwargs):
-        aoi = get_object_or_404(AOI, pk=self.kwargs.get('pk'))
+    def _get_aoi_and_update(self, pk):
+        aoi = get_object_or_404(AOI, pk=pk)
         status = self.kwargs.get('status')
+        return status, aoi
+
+    def _update_aoi(self, request, aoi, status):
+        aoi.analyst = request.user
+        aoi.status = status
+        aoi.save()
+        return aoi
+
+    def get(self, request, **kwargs):
+        # Used to unassign tasks on the job detail, 'in work' tab
+
+        status, aoi = self._get_aoi_and_update(self.kwargs.get('pk'))
 
         if aoi.user_can_complete(request.user):
-            aoi.analyst = request.user
-            aoi.status = status
-            aoi.save()
+            aoi = self._update_aoi(request, aoi, status)
+
+        try:
+            url = request.META['HTTP_REFERER']
+            return redirect(url)
+        except KeyError:
+            return redirect('/geoq/jobs/%s/' % aoi.job.id)
+
+    def post(self, request, **kwargs):
+
+        status, aoi = self._get_aoi_and_update(self.kwargs.get('pk'))
+
+        if aoi.user_can_complete(request.user):
+            aoi = self._update_aoi(request, aoi, status)
 
             # send aoi completion event for badging
-            utils.send_aoi_create_event(request.user, aoi.id, aoi.features.all().count())
+            send_aoi_create_event(request.user, aoi.id, aoi.features.all().count())
             return HttpResponse(json.dumps({aoi.id: aoi.status}), mimetype="application/json")
         else:
             error = dict(error=403,
@@ -270,6 +306,7 @@ def usng(request):
     resp = requests.get(base_url, params=params)
     return HttpResponse(resp, mimetype="application/json")
 
+
 def mgrs(request):
     """
     Create mgrs grid in manner similar to usng above
@@ -283,10 +320,13 @@ def mgrs(request):
     bb = bbox.split(',')
 
     try:
-        grid = Grid(bb[1],bb[0],bb[3],bb[2])
+        grid = Grid(bb[1], bb[0], bb[3], bb[2])
         fc = grid.build_grid_fc()
     except GridException:
         error = dict(error=500, details="Can't create grids across longitudinal boundaries. Try creating a smaller bounding box",)
+        return HttpResponse(json.dumps(error), status=error.get('error'))
+    except ProgramException:
+        error = dict(error=500, details="Error executing external GeoConvert application. Make sure it is installed on the server",)
         return HttpResponse(json.dumps(error), status=error.get('error'))
 
     return HttpResponse(fc.__str__(), mimetype="application/json")
@@ -300,29 +340,28 @@ def geocode(request):
     params['apiKey'] = '57956afd728b4204bee23dbb17f00573'
     params['version'] = '4.01'
 
-def aoi_delete(request,pk):
+def aoi_delete(request, pk):
     try:
         aoi = AOI.objects.get(pk=pk)
         aoi.delete()
     except ObjectDoesNotExist:
         raise Http404
 
-    return HttpResponse( status=200 )
+    return HttpResponse(status=200)
 
 @login_required
 def batch_create_aois(request, *args, **kwargs):
-        aois = request.POST.get('aois')
-        job = Job.objects.get(id=kwargs.get('job_pk'))
+    aois = request.POST.get('aois')
+    job = Job.objects.get(id=kwargs.get('job_pk'))
 
-        try:
-            aois = json.loads(aois)
-        except ValueError:
-            raise ValidationError(_("Enter valid JSON"))
+    try:
+        aois = json.loads(aois)
+    except ValueError:
+        raise ValidationError(_("Enter valid JSON"))
 
+    response = AOI.objects.bulk_create([AOI(name=(aoi.get('name')),
+                                        job=job,
+                                        description=job.description,
+                                        polygon=GEOSGeometry(json.dumps(aoi.get('geometry')))) for aoi in aois])
 
-        response = AOI.objects.bulk_create([AOI(name=(aoi.get('name')),
-                                            job=job,
-                                            description=job.description,
-                                            polygon=GEOSGeometry(json.dumps(aoi.get('geometry')))) for aoi in aois])
-
-        return HttpResponse()
+    return HttpResponse()
